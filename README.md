@@ -7,7 +7,10 @@ The core idea is simple: not all time series patterns are equally represented, a
 QUALS first discovers reusable temporal motifs through vector quantization, then builds uniform semantic bins over the corpus, and finally learns bin-level sampling weights that synchronize convergence across easy and difficult patterns.
 
 > Paper: `QUALS: Corpus Equilibrium for Universal Forecasting via Pattern Quantization and Learnability Synchronization`
+
 > Source code: `https://github.com/blisky-li/QUALS`
+
+> Corpus link: `https://huggingface.co/datasets/Blisky-li/QUALS` (The data of 300G+ is currently being slowly uploaded to HuggingFace)
 
 ## Overview
 
