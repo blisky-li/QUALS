@@ -1,0 +1,41 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local environments
+.env
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Logs and experiment outputs
+logs/
+outputs/
+output/
+checkpoints/
+runs/
+wandb/
+
+# Large generated data/artifacts
+*.dat
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/

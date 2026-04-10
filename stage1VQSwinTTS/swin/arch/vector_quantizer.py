@@ -1,0 +1,1937 @@
+from __future__ import annotations
+from typing import Callable, Union
+
+from math import sqrt
+from functools import partial, cache
+from collections import namedtuple
+
+import torch
+from torch.nn import Module
+from torch import nn, einsum, tensor, is_tensor, Tensor
+import torch.nn.functional as F
+import torch.distributed as distributed
+from torch.optim import Optimizer
+from torch.amp import autocast
+
+import einx
+from einops import rearrange, repeat, reduce, pack, unpack
+
+# ======================================================================
+# Utility functions (官方源码原样，无修改)
+# ======================================================================
+
+def exists(val):
+    """
+    Input:
+        - val: shape [*]; default: required.
+    Method:
+        - Executes the `exists` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return val is not None
+
+def default(val, d):
+    """
+    Input:
+        - val: shape [*]; default: required.
+        - d: shape [*]; default: required.
+    Method:
+        - Executes the `default` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return val if exists(val) else d
+
+def noop(*args, **kwargs):
+    """
+    Input:
+        - *args: shape [*]; default: variadic positional input.
+        - **kwargs: shape [*]; default: variadic keyword input.
+    Method:
+        - Executes the `noop` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    pass
+
+def identity(t):
+    """
+    Input:
+        - t: shape [*]; default: required.
+    Method:
+        - Executes the `identity` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return t
+
+def at_most_one_of(*bools):
+    """
+    Input:
+        - *bools: shape [*]; default: variadic positional input.
+    Method:
+        - Executes the `at_most_one_of` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return sum([*map(int, bools)]) <= 1
+
+def l2norm(t, dim = -1,  eps = 1e-6):
+    """
+    Input:
+        - t: shape [*]; default: required.
+        - dim: shape []; default: -1.
+        - eps: shape [*]; default: 1e-6.
+    Method:
+        - Executes the `l2norm` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return F.normalize(t, p = 2, dim = dim, eps = eps)
+
+def safe_div(num, den, eps = 1e-6):
+    """
+    Input:
+        - num: shape [*]; default: required.
+        - den: shape [*]; default: required.
+        - eps: shape [*]; default: 1e-6.
+    Method:
+        - Executes the `safe_div` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return num / den.clamp(min = eps)
+
+def append_dims_to(t, ndims):
+    """
+    Input:
+        - t: shape [*]; default: required.
+        - ndims: shape [*]; default: required.
+    Method:
+        - Executes the `append_dims_to` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    assert t.ndim <= ndims
+    append_ndims = ndims - t.ndim
+    shape = t.shape
+    return t.reshape(*shape, *((1,) * append_ndims))
+
+def Sequential(*modules):
+    """
+    Input:
+        - *modules: shape [*]; default: variadic positional input.
+    Method:
+        - Executes the `Sequential` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    modules = [*filter(exists, modules)]
+    if len(modules) == 0:
+        return None
+    elif len(modules) == 1:
+        return modules[0]
+    return nn.Sequential(*modules)
+
+def cdist(x, y, eps = 1e-8):
+    """
+    Input:
+        - x: shape [*]; default: required.
+        - y: shape [*]; default: required.
+        - eps: shape [*]; default: 1e-8.
+    Method:
+        - Executes the `cdist` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    x2 = reduce(x ** 2, 'b n d -> b n', 'sum')
+    y2 = reduce(y ** 2, 'b n d -> b n', 'sum')
+    xy = einsum('b i d, b j d -> b i j', x, y) * -2
+    return (rearrange(x2, 'b i -> b i 1') + rearrange(y2, 'b j -> b 1 j') + xy).clamp(min = eps).sqrt()
+
+def log(t, eps = 1e-20):
+    """
+    Input:
+        - t: shape [*]; default: required.
+        - eps: shape [*]; default: 1e-20.
+    Method:
+        - Executes the `log` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return torch.log(t.clamp(min = eps))
+
+def entropy(prob, eps = 1e-5):
+    """
+    Input:
+        - prob: shape [*]; default: required.
+        - eps: shape [*]; default: 1e-5.
+    Method:
+        - Executes the `entropy` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return (-prob * log(prob, eps = eps)).sum(dim = -1)
+
+def accum_grad_(t, grad):
+    """
+    Input:
+        - t: shape [*]; default: required.
+        - grad: shape [*]; default: required.
+    Method:
+        - Executes the `accum_grad_` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    if exists(t.grad):
+        t.grad.add_(grad)
+    else:
+        t.grad = grad.clone().detach()
+
+def ema_inplace(old, new, decay, weight = None):
+    # if old.grad is populated, add it to new and set it to None
+    """
+    Input:
+        - old: shape object; default: required.
+        - new: shape object; default: required.
+        - decay: shape [*]; default: required.
+        - weight: shape [*]; default: None.
+    Method:
+        - Executes the `ema_inplace` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    if exists(old.grad):
+        new.add_(old.grad)
+        old.grad = None
+
+    weight = default(weight, 1.)
+    if is_tensor(weight):
+        if weight.ndim == 1:
+            weight = rearrange(weight, 'c -> 1 c')
+        assert weight.ndim == 2 and weight.shape == old.shape[:2]
+        weight = append_dims_to(weight, old.ndim)
+
+    old.data.lerp_(new, (1. - decay) * weight)
+
+def pack_one(t, pattern):
+    """
+    Input:
+        - t: shape [*]; default: required.
+        - pattern: shape [*]; default: required.
+    Method:
+        - Executes the `pack_one` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    packed, ps = pack([t], pattern)
+    def unpack_one(to_unpack, unpack_pattern = None):
+        """
+        Input:
+            - to_unpack: shape [*]; default: required.
+            - unpack_pattern: shape [*]; default: None.
+        Method:
+            - Executes the `pack_one.unpack_one` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        unpacked, = unpack(to_unpack, ps, default(unpack_pattern, pattern))
+        return unpacked
+    return packed, unpack_one
+
+def lens_to_mask(lens, max_length):
+    """
+    Input:
+        - lens: shape [*]; default: required.
+        - max_length: shape [*]; default: required.
+    Method:
+        - Executes the `lens_to_mask` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    seq = torch.arange(max_length, device = lens.device)
+    return seq < lens[:, None]
+
+def uniform_init(*shape):
+    """
+    Input:
+        - *shape: shape [*]; default: variadic positional input.
+    Method:
+        - Executes the `uniform_init` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    t = torch.empty(shape)
+    nn.init.kaiming_uniform_(t)
+    return t
+
+def gumbel_noise(t):
+    """
+    Input:
+        - t: shape [*]; default: required.
+    Method:
+        - Executes the `gumbel_noise` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+def gumbel_sample(
+    logits,
+    temperature = 1.,
+    stochastic = False,
+    straight_through = False,
+    dim = -1,
+    training = True,
+    topk = None
+):
+    """
+    Input:
+        - logits: shape [*]; default: required.
+        - temperature: shape [*]; default: 1..
+        - stochastic: shape [*]; default: False.
+        - straight_through: shape [*]; default: False.
+        - dim: shape []; default: -1.
+        - training: shape [*]; default: True.
+        - topk: shape [*]; default: None.
+    Method:
+        - Executes the `gumbel_sample` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    dtype, size = logits.dtype, logits.shape[dim]
+
+    if training and stochastic and temperature > 0:
+        sampling_logits = (logits / temperature) + gumbel_noise(logits)
+    else:
+        sampling_logits = logits
+
+    if exists(topk):
+        ind = sampling_logits.topk(topk, dim = dim).indices
+    else:
+        ind = sampling_logits.argmax(dim = dim)
+
+    one_hot = F.one_hot(ind, size).type(dtype)
+
+    if not straight_through or temperature <= 0. or not training:
+        return ind, one_hot
+
+    π1 = (logits / temperature).softmax(dim = dim)
+    one_hot = one_hot + π1 - π1.detach()
+
+    return ind, one_hot
+
+def laplace_smoothing(x, n_categories, eps = 1e-5, dim = -1):
+    """
+    Input:
+        - x: shape [*]; default: required.
+        - n_categories: shape [*]; default: required.
+        - eps: shape [*]; default: 1e-5.
+        - dim: shape []; default: -1.
+    Method:
+        - Executes the `laplace_smoothing` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    denom = x.sum(dim = dim, keepdim = True)
+    return (x + eps) / (denom + n_categories * eps)
+
+def sample_vectors(samples, num):
+    """
+    Input:
+        - samples: shape [*]; default: required.
+        - num: shape [*]; default: required.
+    Method:
+        - Executes the `sample_vectors` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    num_samples, device = samples.shape[0], samples.device
+    if num_samples >= num:
+        indices = torch.randperm(num_samples, device = device)[:num]
+    else:
+        indices = torch.randint(0, num_samples, (num,), device = device)
+    return samples[indices]
+
+def batched_sample_vectors(samples, num):
+    """
+    Input:
+        - samples: shape [*]; default: required.
+        - num: shape [*]; default: required.
+    Method:
+        - Executes the `batched_sample_vectors` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return torch.stack([sample_vectors(sample, num) for sample in samples.unbind(dim = 0)], dim = 0)
+
+def pad_shape(shape, size, dim = 0):
+    """
+    Input:
+        - shape: shape [N]; default: required.
+        - size: shape [*]; default: required.
+        - dim: shape []; default: 0.
+    Method:
+        - Executes the `pad_shape` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return [size if i == dim else s for i, s in enumerate(shape)]
+
+def sample_multinomial(total_count, probs):
+    """
+    Input:
+        - total_count: shape [*]; default: required.
+        - probs: shape [*]; default: required.
+    Method:
+        - Executes the `sample_multinomial` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    device = probs.device
+    probs = probs.cpu()
+
+    total_count = probs.new_full((), total_count)
+    remainder = probs.new_ones(())
+    sample = torch.empty_like(probs, dtype = torch.long)
+
+    num_probs = len(probs)
+
+    for i, prob in enumerate(probs):
+        is_last = i == (num_probs - 1)
+        s = torch.binomial(total_count, prob / remainder) if not is_last else total_count
+        sample[i] = s
+        total_count -= s
+        remainder -= prob
+
+    assert total_count == 0, f'invalid total count {total_count}'
+    return sample.to(device)
+
+def all_gather_sizes(x, dim):
+    """
+    Input:
+        - x: shape [*]; default: required.
+        - dim: shape []; default: required.
+    Method:
+        - Executes the `all_gather_sizes` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    size = tensor(x.shape[dim], dtype = torch.long, device = x.device)
+    all_sizes = [torch.empty_like(size) for _ in range(distributed.get_world_size())]
+    distributed.all_gather(all_sizes, size)
+    return torch.stack(all_sizes)
+
+def all_gather_variably_sized(x, sizes, dim = 0):
+    """
+    Input:
+        - x: shape [*]; default: required.
+        - sizes: shape [*]; default: required.
+        - dim: shape []; default: 0.
+    Method:
+        - Executes the `all_gather_variably_sized` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    rank = distributed.get_rank()
+    all_x = []
+
+    for i, size in enumerate(sizes):
+        t = x if i == rank else x.new_empty(pad_shape(x.shape, size, dim))
+        distributed.broadcast(t, src = i, async_op = True)
+        all_x.append(t)
+
+    distributed.barrier()
+    return all_x
+
+def sample_vectors_distributed(local_samples, num):
+    """
+    Input:
+        - local_samples: shape [*]; default: required.
+        - num: shape [*]; default: required.
+    Method:
+        - Executes the `sample_vectors_distributed` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    local_samples = rearrange(local_samples, '1 ... -> ...')
+
+    rank = distributed.get_rank()
+    all_num_samples = all_gather_sizes(local_samples, dim = 0)
+
+    if rank == 0:
+        samples_per_rank = sample_multinomial(num, all_num_samples / all_num_samples.sum())
+    else:
+        samples_per_rank = torch.empty_like(all_num_samples)
+
+    distributed.broadcast(samples_per_rank, src = 0)
+    samples_per_rank = samples_per_rank.tolist()
+
+    local_samples = sample_vectors(local_samples, samples_per_rank[rank])
+    all_samples = all_gather_variably_sized(local_samples, samples_per_rank, dim = 0)
+    out = torch.cat(all_samples, dim = 0)
+
+    return rearrange(out, '... -> 1 ...')
+
+def batched_bincount(x, *, minlength):
+    """
+    Input:
+        - x: shape [*]; default: required.
+        - minlength: shape [*]; default: required.
+    Method:
+        - Executes the `batched_bincount` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    batch, dtype, device = x.shape[0], x.dtype, x.device
+    target = torch.zeros(batch, minlength, dtype = dtype, device = device)
+    values = torch.ones_like(x)
+    target.scatter_add_(-1, x, values)
+    return target
+
+def kmeans(
+    samples,
+    num_clusters,
+    num_iters = 10,
+    use_cosine_sim = False,
+    sample_fn = batched_sample_vectors,
+    all_reduce_fn = noop
+):
+    """
+    Input:
+        - samples: shape [*]; default: required.
+        - num_clusters: shape []; default: required.
+        - num_iters: shape []; default: 10.
+        - use_cosine_sim: shape [*]; default: False.
+        - sample_fn: shape [*]; default: batched_sample_vectors.
+        - all_reduce_fn: shape [*]; default: noop.
+    Method:
+        - Executes the `kmeans` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    num_codebooks, dim, dtype, device = samples.shape[0], samples.shape[-1], samples.dtype, samples.device
+
+    means = sample_fn(samples, num_clusters)
+
+    for _ in range(num_iters):
+        if use_cosine_sim:
+            dists = samples @ rearrange(means, 'h n d -> h d n')
+            # print(dists.shape)
+        else:
+            dists = -cdist(samples, means)
+
+        buckets = torch.argmax(dists, dim = -1)
+        bins = batched_bincount(buckets, minlength = num_clusters)
+        all_reduce_fn(bins)
+
+        zero_mask = bins == 0
+        bins_min_clamped = bins.masked_fill(zero_mask, 1)
+
+        new_means = buckets.new_zeros(num_codebooks, num_clusters, dim, dtype = dtype)
+
+        new_means.scatter_add_(1, repeat(buckets, 'h n -> h n d', d = dim), samples)
+        new_means = new_means / rearrange(bins_min_clamped, '... -> ... 1')
+        all_reduce_fn(new_means)
+
+        if use_cosine_sim:
+            new_means = l2norm(new_means)
+
+        means = torch.where(
+            rearrange(zero_mask, '... -> ... 1'),
+            means,
+            new_means
+        )
+
+    return means, bins
+
+# straight through
+
+def straight_through(src, tgt):
+    """
+    Input:
+        - src: shape [*]; default: required.
+        - tgt: shape [*]; default: required.
+    Method:
+        - Executes the `straight_through` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    return src + (tgt - src).detach()
+
+# rotation trick related
+
+def efficient_rotation_trick_transform(u, q, e):
+    """
+    Input:
+        - u: shape [*]; default: required.
+        - q: shape [*]; default: required.
+        - e: shape [*]; default: required.
+    Method:
+        - Executes the `efficient_rotation_trick_transform` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    e = rearrange(e, 'b d -> b 1 d')
+    w = l2norm(u + q, dim = 1).detach()
+
+    out = (
+        e -
+        2 * (e @ rearrange(w, 'b d -> b d 1') @ rearrange(w, 'b d -> b 1 d')) +
+        2 * (e @ rearrange(u, 'b d -> b d 1').detach() @ rearrange(q, 'b d -> b 1 d').detach())
+    )
+
+    return rearrange(out, '... 1 d -> ... d')
+
+def rotate_to(src, tgt):
+    # rotation trick STE (https://arxiv.org/abs/2410.06424) to get gradients through VQ layer.
+    """
+    Input:
+        - src: shape [*]; default: required.
+        - tgt: shape [*]; default: required.
+    Method:
+        - Executes the `rotate_to` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    src, inverse = pack_one(src, '* d')
+    tgt, _ = pack_one(tgt, '* d')
+
+    norm_src = src.norm(dim = -1, keepdim = True)
+    norm_tgt = tgt.norm(dim = -1, keepdim = True)
+
+    rotated_tgt = efficient_rotation_trick_transform(
+        safe_div(src, norm_src),
+        safe_div(tgt, norm_tgt),
+        src
+    )
+
+    rotated = rotated_tgt * safe_div(norm_tgt, norm_src).detach()
+
+    return inverse(rotated)
+
+# directional reparam related
+# figure 1. https://openreview.net/forum?id=KRVnpTbx7R
+
+def directional_reparam(src, tgt, noise_variance = 5e-3):
+    """
+    Input:
+        - src: shape [*]; default: required.
+        - tgt: shape [*]; default: required.
+        - noise_variance: shape [*]; default: 5e-3.
+    Method:
+        - Executes the `directional_reparam` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    error_dir = tgt - src
+    error_dir_norm = error_dir.norm(dim = -1, keepdim = True)
+
+    noised_dir = error_dir + sqrt(noise_variance) * torch.randn_like(error_dir)
+    unit_noised_dir = l2norm(noised_dir)
+
+    return src + unit_noised_dir * error_dir_norm
+
+# distributed helpers
+
+@cache
+def is_distributed():
+    """
+    Input:
+        - No external inputs beyond module state.
+    Method:
+        - Executes the `is_distributed` logic using the provided inputs and current module state.
+    Output:
+        - return: shape []; boolean result.
+    """
+    return distributed.is_initialized() and distributed.get_world_size() > 1
+
+# regularization losses
+
+def orthogonal_loss_fn(t):
+    # eq (2) from https://arxiv.org/abs/2112.00384
+    """
+    Input:
+        - t: shape [*]; default: required.
+    Method:
+        - Executes the `orthogonal_loss_fn` logic using the provided inputs and current module state.
+    Output:
+        - return: value(s) produced by this helper; exact shape follows the implementation below.
+    """
+    h, n = t.shape[:2]
+    normed_codes = l2norm(t)
+    cosine_sim = einsum('h i d, h j d -> h i j', normed_codes, normed_codes)
+    return (cosine_sim ** 2).sum() / (h * n ** 2) - (1 / n)
+
+# distance types
+
+class Codebook(Module):
+    def __init__(
+        self,
+        dim,
+        codebook_size,
+        num_codebooks = 1,
+        kmeans_init = False,
+        kmeans_iters = 10,
+        sync_kmeans = True,
+        decay = 0.8,
+        eps = 1e-5,
+        threshold_ema_dead_code = 1,
+        reset_cluster_size = None,
+        use_ddp = False,
+        learnable_codebook = False,
+        gumbel_sample = gumbel_sample,
+        sample_codebook_temp = 1.,
+        ema_update = True,
+        manual_ema_update = False,
+        affine_param = False,
+        sync_affine_param = False,
+        affine_param_batch_decay = 0.99,
+        affine_param_codebook_decay = 0.9,
+        use_cosine_sim = False
+    ):
+        """
+        Input:
+            - dim: shape []; default: required.
+            - codebook_size: shape [*]; default: required.
+            - num_codebooks: shape []; default: 1.
+            - kmeans_init: shape [*]; default: False.
+            - kmeans_iters: shape [*]; default: 10.
+            - sync_kmeans: shape [*]; default: True.
+            - decay: shape [*]; default: 0.8.
+            - eps: shape [*]; default: 1e-5.
+            - threshold_ema_dead_code: shape [*]; default: 1.
+            - reset_cluster_size: shape [*]; default: None.
+            - use_ddp: shape [*]; default: False.
+            - learnable_codebook: shape [*]; default: False.
+            - gumbel_sample: shape [*]; default: gumbel_sample.
+            - sample_codebook_temp: shape [*]; default: 1..
+            - ema_update: shape [*]; default: True.
+            - manual_ema_update: shape [*]; default: False.
+            - affine_param: shape [*]; default: False.
+            - sync_affine_param: shape [*]; default: False.
+            - affine_param_batch_decay: shape [*]; default: 0.99.
+            - affine_param_codebook_decay: shape [*]; default: 0.9.
+            - use_cosine_sim: shape [*]; default: False.
+        Method:
+            - Executes the `Codebook.__init__` logic using the provided inputs and current module state.
+        Output:
+            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
+        """
+        super().__init__()
+        self.transform_input = identity if not use_cosine_sim else l2norm
+
+        self.decay = decay
+        self.ema_update = ema_update
+        self.manual_ema_update = manual_ema_update
+
+        if kmeans_init:
+            embed = torch.zeros(num_codebooks, codebook_size, dim)
+        else:
+            embed = uniform_init(num_codebooks, codebook_size, dim)
+
+            if use_cosine_sim:
+                embed = l2norm(embed)
+
+        self.codebook_size = codebook_size
+        self.num_codebooks = num_codebooks
+
+        self.kmeans_iters = kmeans_iters
+        self.eps = eps
+        self.threshold_ema_dead_code = threshold_ema_dead_code
+        self.reset_cluster_size = default(reset_cluster_size, threshold_ema_dead_code)
+
+        assert callable(gumbel_sample)
+        self.gumbel_sample = gumbel_sample
+        self.sample_codebook_temp = sample_codebook_temp
+
+        assert not (use_ddp and num_codebooks > 1 and kmeans_init), 'kmeans init is not compatible with multiple codebooks in distributed environment for now'
+
+        self.sample_fn = sample_vectors_distributed if use_ddp and sync_kmeans else batched_sample_vectors
+
+        self.replace_sample_fn = sample_vectors_distributed if use_ddp and sync_kmeans else batched_sample_vectors
+
+        self.kmeans_all_reduce_fn = distributed.all_reduce if use_ddp and sync_kmeans else noop
+        self.all_reduce_fn = distributed.all_reduce if use_ddp else noop
+
+        self.register_buffer('initted', tensor(not kmeans_init))
+        self.register_buffer('cluster_size', torch.ones(num_codebooks, codebook_size))
+        self.register_buffer('embed_avg', embed.clone())
+
+        self.learnable_codebook = learnable_codebook
+        if learnable_codebook:
+            self.embed = nn.Parameter(embed)
+        else:
+            self.register_buffer('embed', embed)
+
+        self.use_cosine_sim = use_cosine_sim
+
+        # affine related params
+
+        self.affine_param = affine_param
+        self.sync_affine_param = sync_affine_param
+
+        if not affine_param:
+            return
+
+        self.affine_param_batch_decay = affine_param_batch_decay
+        self.affine_param_codebook_decay = affine_param_codebook_decay
+
+        self.register_buffer('batch_mean', None)
+        self.register_buffer('batch_variance', None)
+
+        self.register_buffer('codebook_mean_needs_init', tensor(True))
+        self.register_buffer('codebook_mean', torch.empty(num_codebooks, 1, dim))
+        self.register_buffer('codebook_variance_needs_init', tensor(True))
+        self.register_buffer('codebook_variance', torch.empty(num_codebooks, 1, dim))
+    
+
+    @torch.jit.ignore
+    def init_embed_(self, data, mask = None):
+        """
+        Input:
+            - data: shape [*]; default: required.
+            - mask: shape [*]; default: None.
+        Method:
+            - Executes the `Codebook.init_embed_` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        if self.initted:
+            return
+
+        if exists(mask):
+            c = data.shape[0]
+            data = rearrange(data[mask], '(c n) d -> c n d', c = c)
+
+        embed, cluster_size = kmeans(
+            data,
+            self.codebook_size,
+            self.kmeans_iters,
+            use_cosine_sim = self.use_cosine_sim,
+            sample_fn = self.sample_fn,
+            all_reduce_fn = self.kmeans_all_reduce_fn
+        )
+
+        embed_sum = embed * rearrange(cluster_size, '... -> ... 1')
+
+        self.embed_avg.data.copy_(embed_sum)
+        self.cluster_size.data.copy_(cluster_size)
+        self.update_ema()
+        self.initted.data.copy_(tensor(True))
+
+    @torch.jit.ignore
+    def update_with_decay(self, buffer_name, new_value, decay):
+        """
+        Input:
+            - buffer_name: shape [*]; default: required.
+            - new_value: shape [*]; default: required.
+            - decay: shape [*]; default: required.
+        Method:
+            - Executes the `Codebook.update_with_decay` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        old_value = getattr(self, buffer_name)
+
+        needs_init = getattr(self, buffer_name + "_needs_init", False)
+
+        if needs_init:
+            self.register_buffer(buffer_name + "_needs_init", tensor(False))
+
+        if not exists(old_value) or needs_init:
+            self.register_buffer(buffer_name, new_value.detach())
+
+            return
+
+        value = old_value * decay + new_value.detach() * (1 - decay)
+        self.register_buffer(buffer_name, value)
+
+    @torch.jit.ignore
+    def update_affine(self, data, embed, mask = None):
+        """
+        Input:
+            - data: shape [*]; default: required.
+            - embed: shape [*]; default: required.
+            - mask: shape [*]; default: None.
+        Method:
+            - Executes the `Codebook.update_affine` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        assert self.affine_param
+
+        var_fn = partial(torch.var, unbiased = False)
+
+        # calculate codebook mean and variance
+
+        embed = rearrange(embed, 'h ... d -> h (...) d')
+
+        if self.training:
+            self.update_with_decay('codebook_mean', reduce(embed, 'h n d -> h 1 d', 'mean'), self.affine_param_codebook_decay)
+            self.update_with_decay('codebook_variance', reduce(embed, 'h n d -> h 1 d', var_fn), self.affine_param_codebook_decay)
+
+        # prepare batch data, which depends on whether it has masking
+
+        data = rearrange(data, 'h ... d -> h (...) d')
+
+        if exists(mask):
+            c = data.shape[0]
+            data = rearrange(data[mask], '(c n) d -> c n d', c = c)
+
+        # calculate batch mean and variance
+
+        if not self.sync_affine_param:
+            self.update_with_decay('batch_mean', reduce(data, 'h n d -> h 1 d', 'mean'), self.affine_param_batch_decay)
+            self.update_with_decay('batch_variance', reduce(data, 'h n d -> h 1 d', var_fn), self.affine_param_batch_decay)
+            return
+
+        num_vectors, device, dtype = data.shape[-2], data.device, data.dtype
+
+        # number of vectors, for denominator
+
+        num_vectors = tensor(num_vectors, device = device, dtype = dtype)
+        distributed.all_reduce(num_vectors)
+
+        # calculate distributed mean
+
+        batch_sum = reduce(data, 'h n d -> h 1 d', 'sum')
+        distributed.all_reduce(batch_sum)
+        batch_mean = batch_sum / num_vectors
+
+        self.update_with_decay('batch_mean', batch_mean, self.affine_param_batch_decay)
+
+        # calculate distributed variance
+
+        variance_numer = reduce((data - batch_mean) ** 2, 'h n d -> h 1 d', 'sum')
+        distributed.all_reduce(variance_numer)
+        batch_variance = variance_numer / num_vectors
+
+        self.update_with_decay('batch_variance', batch_variance, self.affine_param_batch_decay)
+
+    def replace(self, batch_samples, batch_mask):
+        """
+        Input:
+            - batch_samples: shape [*]; default: required.
+            - batch_mask: shape [*]; default: required.
+        Method:
+            - Executes the `Codebook.replace` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        if self.use_cosine_sim:
+            batch_samples = l2norm(batch_samples)
+
+        for ind, (samples, mask) in enumerate(zip(batch_samples, batch_mask)):
+            sampled = self.replace_sample_fn(rearrange(samples, '... -> 1 ...'), mask.sum().item())
+            sampled = rearrange(sampled, '1 ... -> ...')
+
+            self.embed.data[ind][mask] = sampled
+            self.cluster_size.data[ind][mask] = self.reset_cluster_size
+            self.embed_avg.data[ind][mask] = sampled * self.reset_cluster_size
+
+    def expire_codes_(self, batch_samples):
+        """
+        Input:
+            - batch_samples: shape [*]; default: required.
+        Method:
+            - Executes the `Codebook.expire_codes_` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        if self.threshold_ema_dead_code == 0:
+            return
+
+        expired_codes = self.cluster_size < self.threshold_ema_dead_code
+
+        if not torch.any(expired_codes):
+            return
+
+        batch_samples = rearrange(batch_samples, 'h ... d -> h (...) d')
+        self.replace(batch_samples, batch_mask = expired_codes)
+
+    def update_ema(self):
+        """
+        Input:
+            - No external inputs beyond module state.
+        Method:
+            - Executes the `Codebook.update_ema` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        cluster_size = laplace_smoothing(self.cluster_size, self.codebook_size, self.eps) * self.cluster_size.sum(dim = -1, keepdim = True)
+
+        embed_normalized = self.embed_avg / rearrange(cluster_size, '... -> ... 1')
+
+        if self.use_cosine_sim:
+            embed_normalized = l2norm(embed_normalized)
+
+        self.embed.data.copy_(embed_normalized)
+
+    def update_ema_part(
+        self,
+        flatten,
+        embed_onehot,
+        mask = None,
+        ema_update_weight: Tensor | Callable | None = None,
+        accum_ema_update = False
+    ):
+        """
+        Input:
+            - flatten: shape [*]; default: required.
+            - embed_onehot: shape [*]; default: required.
+            - mask: shape [*]; default: None.
+            - ema_update_weight (Tensor | Callable | None): shape [*]; default: None.
+            - accum_ema_update: shape [*]; default: False.
+        Method:
+            - Executes the `Codebook.update_ema_part` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        if self.affine_param:
+            codebook_std = self.codebook_variance.clamp(min = 1e-5).sqrt()
+            batch_std = self.batch_variance.clamp(min = 1e-5).sqrt()
+            flatten = (flatten - self.batch_mean) * (codebook_std / batch_std) + self.codebook_mean
+
+        if exists(mask):
+            embed_onehot[~mask] = 0.
+
+        cluster_size = embed_onehot.sum(dim = 1)
+        self.all_reduce_fn(cluster_size)
+
+        embed_sum = einsum('h n d, h n c -> h c d', flatten, embed_onehot)
+        embed_sum = embed_sum.contiguous()
+        self.all_reduce_fn(embed_sum)
+
+        if callable(ema_update_weight):
+            ema_update_weight = ema_update_weight(embed_sum, cluster_size)
+
+        if accum_ema_update:
+            accum_grad_(self.cluster_size, cluster_size)
+            accum_grad_(self.embed_avg, embed_sum)
+        else:
+            ema_inplace(self.cluster_size, cluster_size, self.decay, ema_update_weight)
+            ema_inplace(self.embed_avg, embed_sum, self.decay, ema_update_weight)
+
+            if not self.manual_ema_update:
+                self.update_ema()
+                self.expire_codes_(flatten)
+
+    def update_ema_indices(
+        self,
+        x,
+        embed_ind,
+        mask = None,
+        ema_update_weight: Tensor | Callable | None = None,
+        accum_ema_update = False
+    ):
+        """
+        Input:
+            - x: shape [*]; default: required.
+            - embed_ind: shape [*]; default: required.
+            - mask: shape [*]; default: None.
+            - ema_update_weight (Tensor | Callable | None): shape [*]; default: None.
+            - accum_ema_update: shape [*]; default: False.
+        Method:
+            - Executes the `Codebook.update_ema_indices` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        needs_codebook_dim = x.ndim < 4
+        x = x.float()
+
+        if needs_codebook_dim:
+            x = rearrange(x, '... -> 1 ...')
+
+        dtype = x.dtype
+        flatten, unpack_one = pack_one(x, 'h * d')
+
+        if exists(mask):
+            mask = repeat(mask, 'b n -> c (b h n)', c = flatten.shape[0], h = flatten.shape[-2] // (mask.shape[0] * mask.shape[1]))
+
+        embed_ind, _ = pack([embed_ind], 'h *')
+        embed_ind = embed_ind.masked_fill(embed_ind == -1, 0)
+        embed_onehot = F.one_hot(embed_ind, self.codebook_size).type(dtype)
+
+        self.update_ema_part(flatten, embed_onehot, mask = mask, ema_update_weight = ema_update_weight, accum_ema_update = accum_ema_update)
+
+    @autocast('cuda', enabled = False)
+    def forward(
+        self,
+        x,
+        sample_codebook_temp = None,
+        mask = None,
+        freeze_codebook = False,
+        codebook_transform_fn: Callable | None = None,
+        ema_update_weight: Tensor | Callable | None = None,
+        accum_ema_update = False,
+        ema_update = None,
+        topk = None
+    ):
+        """
+        Input:
+            - x (torch.Tensor): shape [B, N, D] or compatible token-major layout; default: required.
+            - sample_codebook_temp (float | None): shape []; default: None.
+            - mask (torch.Tensor | None): shape [B, N] or None; default: None.
+            - freeze_codebook (bool): shape []; default: False.
+        Method:
+            - Finds nearest codebook entries for each token, optionally updates EMA statistics, and returns quantized embeddings plus auxiliary training signals.
+        Output:
+            - return: tuple containing quantized embeddings, code indices, distance-based statistics, and EMA bookkeeping values used later by `VectorQuantizer`.
+        """
+        ema_update = default(ema_update, self.ema_update)
+
+        needs_codebook_dim = x.ndim < 4
+        sample_codebook_temp = default(sample_codebook_temp, self.sample_codebook_temp)
+
+        x = x.float()
+
+        if needs_codebook_dim:
+            x = rearrange(x, '... -> 1 ...')
+
+        dtype = x.dtype
+        flatten, unpack_one = pack_one(x, 'h * d')
+
+        if exists(mask):
+            mask = repeat(mask, 'b n -> c (b h n)', c = flatten.shape[0], h = flatten.shape[-2] // (mask.shape[0] * mask.shape[1]))
+
+        self.init_embed_(flatten, mask = mask)
+
+        if self.affine_param:
+            self.update_affine(flatten, self.embed, mask = mask)
+
+        # get maybe learnable codes
+
+        embed = self.embed if self.learnable_codebook else self.embed.detach()
+
+        embed = embed.to(dtype)
+
+        # affine params
+
+        if self.affine_param:
+            codebook_std = self.codebook_variance.clamp(min = 1e-5).sqrt()
+            batch_std = self.batch_variance.clamp(min = 1e-5).sqrt()
+            embed = (embed - self.codebook_mean) * (batch_std / codebook_std) + self.batch_mean
+
+        # handle maybe implicit neural codebook
+        # and calculate distance
+        # print(self.use_cosine_sim,'xxxxxxxxxxxxxxxxxx')
+        if exists(codebook_transform_fn):
+            transformed_embed = codebook_transform_fn(embed)
+            transformed_embed = rearrange(transformed_embed, 'h b n c d -> h (b n) c d')
+
+            if self.use_cosine_sim:
+                transformed_embed = l2norm(transformed_embed)
+                dist = einsum('h n d, h n c d -> h n c', flatten, transformed_embed)
+                # print('dist:,', torch.mean(dist))
+            else:
+                broadcastable_input = rearrange(flatten, '... d -> ... 1 d')
+                dist = -F.pairwise_distance(broadcastable_input, transformed_embed)
+        else:
+            if self.use_cosine_sim:
+                 dist = einsum('h n d, h c d -> h n c', flatten, embed)
+                 # print('dist:,', torch.mean(dist))
+
+            else:
+                 dist = -cdist(flatten, embed)
+
+        # sample or argmax depending on temperature
+
+        embed_ind, embed_onehot = self.gumbel_sample(dist, dim = -1, topk = topk, temperature = sample_codebook_temp, training = self.training)
+
+        if exists(topk):
+            embed_ind = unpack_one(embed_ind, 'h * k')
+        else:
+            embed_ind = unpack_one(embed_ind, 'h *')
+
+        if exists(codebook_transform_fn):
+            transformed_embed = unpack_one(transformed_embed, 'h * c d')
+
+        if self.training:
+            if exists(topk):
+                unpacked_onehot = unpack_one(embed_onehot, 'h * k c')
+            else:
+                unpacked_onehot = unpack_one(embed_onehot, 'h * c')
+
+            if exists(codebook_transform_fn):
+                quantize = einsum('h b n ... c, h b n c d -> h b n ... d', unpacked_onehot, transformed_embed)
+            else:
+                quantize = einsum('h b n ... c, h c d -> h b n ... d', unpacked_onehot, embed)
+
+        else:
+            if exists(codebook_transform_fn):
+                # quantize = einx.get_at('h b n [c] d, h b n -> h b n d', transformed_embed, embed_ind)
+
+                repeated_embed_ind = repeat(embed_ind, 'h b n -> h b n 1 d', d = transformed_embed.shape[-1])
+                quantize = transformed_embed.gather(-2, repeated_embed_ind)
+                quantize = rearrange(quantize, 'h b n 1 d -> h b n d')
+
+            else:
+                # quantize = einx.get_at('h [c] d, h b n -> h b n d', embed, embed_ind)
+
+                repeated_embed = repeat(embed, 'h c d -> h b c d', b = embed_ind.shape[1])
+                repeated_embed_ind = repeat(embed_ind, 'h b n -> h b n d', d = embed.shape[-1])
+                quantize = repeated_embed.gather(-2, repeated_embed_ind)
+
+        if self.training and ema_update and not freeze_codebook and not exists(topk):
+            self.update_ema_part(flatten, embed_onehot, mask = mask, ema_update_weight = ema_update_weight, accum_ema_update = accum_ema_update)
+
+        if needs_codebook_dim:
+            quantize, embed_ind = map(lambda t: rearrange(t, '1 ... -> ...'), (quantize, embed_ind))
+
+        dist = unpack_one(dist, 'h * d')
+
+        return quantize, embed_ind, dist
+
+# main class
+
+LossBreakdown = namedtuple('LossBreakdown', [
+    'commitment',
+    'codebook_diversity',
+    'orthogonal_reg',
+    'inplace_optimize',
+])
+
+
+class VectorQuantizer(Module):
+    def __init__(
+        self,
+        dim,
+        codebook_size,
+        codebook_dim=None,
+        heads=1,
+        separate_codebook_per_head=False,
+        decay=0.8,
+        eps=1e-5,
+        freeze_codebook=False,
+        kmeans_init=False,
+        kmeans_iters=10,
+        sync_kmeans=True,
+        use_cosine_sim=False,
+        layernorm_after_project_in=False,
+        threshold_ema_dead_code= 5,
+        channel_last=True,
+        accept_image_fmap=False,
+        commitment_weight=1,
+        commitment_use_cross_entropy_loss=False,
+        orthogonal_reg_weight=0.,
+        orthogonal_reg_active_codes_only=False,
+        orthogonal_reg_max_codes=None,
+        codebook_diversity_loss_weight=0.005,
+        codebook_diversity_temperature=5.,
+        stochastic_sample_codes=False,
+        sample_codebook_temp=1.,
+        straight_through=False,
+        rotation_trick=None,
+        directional_reparam=False,
+        directional_reparam_variance=5e-3,
+        sync_codebook=True,
+        sync_affine_param=False,
+        ema_update=None,
+        manual_ema_update=False,
+        learnable_codebook=None,
+        in_place_codebook_optimizer: Callable[..., Optimizer] = None,
+        manual_in_place_optimizer_update=False,
+        affine_param=False,
+        affine_param_batch_decay=0.99,
+        affine_param_codebook_decay=0.9,
+        sync_update_v=0,
+        return_zeros_for_masked_padding=True
+    ):
+        """
+        Input:
+            - dim: shape []; default: required.
+            - codebook_size: shape [*]; default: required.
+            - codebook_dim: shape [*]; default: None.
+            - heads: shape [*]; default: 1.
+            - separate_codebook_per_head: shape [*]; default: False.
+            - decay: shape [*]; default: 0.8.
+            - eps: shape [*]; default: 1e-5.
+            - freeze_codebook: shape [*]; default: False.
+            - kmeans_init: shape [*]; default: False.
+            - kmeans_iters: shape [*]; default: 10.
+            - sync_kmeans: shape [*]; default: True.
+            - use_cosine_sim: shape [*]; default: False.
+            - layernorm_after_project_in: shape [*]; default: False.
+            - threshold_ema_dead_code: shape [*]; default: 5.
+            - channel_last: shape [*]; default: True.
+            - accept_image_fmap: shape [*]; default: False.
+            - commitment_weight: shape [*]; default: 1.
+            - commitment_use_cross_entropy_loss: shape [*]; default: False.
+            - orthogonal_reg_weight: shape [*]; default: 0..
+            - orthogonal_reg_active_codes_only: shape [*]; default: False.
+            - orthogonal_reg_max_codes: shape [*]; default: None.
+            - codebook_diversity_loss_weight: shape [*]; default: 0.005.
+            - codebook_diversity_temperature: shape [*]; default: 5..
+            - stochastic_sample_codes: shape [*]; default: False.
+            - sample_codebook_temp: shape [*]; default: 1..
+            - straight_through: shape [*]; default: False.
+            - rotation_trick: shape [*]; default: None.
+            - directional_reparam: shape [*]; default: False.
+            - directional_reparam_variance: shape [*]; default: 5e-3.
+            - sync_codebook: shape [*]; default: True.
+            - sync_affine_param: shape [*]; default: False.
+            - ema_update: shape [*]; default: None.
+            - manual_ema_update: shape [*]; default: False.
+            - learnable_codebook: shape [*]; default: None.
+            - in_place_codebook_optimizer (Callable[..., Optimizer]): shape [*]; default: None.
+            - manual_in_place_optimizer_update: shape [*]; default: False.
+            - affine_param: shape [*]; default: False.
+            - affine_param_batch_decay: shape [*]; default: 0.99.
+            - affine_param_codebook_decay: shape [*]; default: 0.9.
+            - sync_update_v: shape [*]; default: 0.
+            - return_zeros_for_masked_padding: shape [*]; default: True.
+        Method:
+            - Executes the `VectorQuantizer.__init__` logic using the provided inputs and current module state.
+        Output:
+            - return: None. The module stores the initialized submodules and hyperparameters in `self`.
+        """
+        super().__init__()
+
+        # ---------- defaults ----------
+        ema_update = default(ema_update, not directional_reparam)
+        learnable_codebook = default(learnable_codebook, directional_reparam)
+        rotation_trick = default(rotation_trick, not directional_reparam and dim > 1)
+
+        # ---------- basic attributes ----------
+        self.dim = dim
+        self.heads = heads
+        self.separate_codebook_per_head = separate_codebook_per_head
+
+        codebook_dim = default(codebook_dim, dim)
+        codebook_input_dim = codebook_dim * heads
+        requires_projection = codebook_input_dim != dim
+
+        # ---------- projections ----------
+        self.project_in = \
+            nn.Sequential(
+                nn.Linear(dim, codebook_input_dim),
+                nn.LayerNorm(codebook_input_dim) if layernorm_after_project_in else nn.Identity()
+            ) if requires_projection else nn.Identity()
+
+        self.project_out = \
+            nn.Linear(codebook_input_dim, dim) if requires_projection else nn.Identity()
+
+        self.eps = eps
+        self.has_commitment_loss = commitment_weight > 0. and not directional_reparam
+        self.commitment_weight = commitment_weight
+        self.commitment_use_cross_entropy_loss = commitment_use_cross_entropy_loss
+
+        # ---------- codebook ----------
+        assert not (use_cosine_sim and learnable_codebook), \
+            'cosine sim distance codebook not compatible with learnable codebook yet'
+        self.learnable_codebook = learnable_codebook
+
+        has_codebook_orthogonal_loss = orthogonal_reg_weight > 0.
+        self.has_codebook_orthogonal_loss = has_codebook_orthogonal_loss
+        self.orthogonal_reg_weight = orthogonal_reg_weight
+        self.orthogonal_reg_active_codes_only = orthogonal_reg_active_codes_only
+        self.orthogonal_reg_max_codes = orthogonal_reg_max_codes
+
+        has_codebook_diversity_loss = codebook_diversity_loss_weight > 0.
+        self.has_codebook_diversity_loss = has_codebook_diversity_loss
+        self.codebook_diversity_temperature = codebook_diversity_temperature
+        self.codebook_diversity_loss_weight = codebook_diversity_loss_weight
+
+        assert at_most_one_of(straight_through, rotation_trick, directional_reparam)
+        self.rotation_trick = rotation_trick
+        self.directional_reparam = directional_reparam
+        self.directional_reparam_variance = directional_reparam_variance
+
+        assert not (ema_update and learnable_codebook), \
+            'learnable codebook not compatible with EMA update'
+
+        assert 0 <= sync_update_v <= 1.
+        assert not (sync_update_v > 0. and not learnable_codebook)
+        self.sync_update_v = sync_update_v
+        self.use_cosine_sim = use_cosine_sim
+        # ---------- instantiate official Codebook ----------
+        if not exists(sync_codebook):
+            sync_codebook = is_distributed()
+
+        codebook_kwargs = dict(
+            dim=codebook_dim,
+            num_codebooks=heads if separate_codebook_per_head else 1,
+            codebook_size=codebook_size,
+            kmeans_init=kmeans_init,
+            kmeans_iters=kmeans_iters,
+            sync_kmeans=sync_kmeans,
+            decay=decay,
+            eps=eps,
+            threshold_ema_dead_code=threshold_ema_dead_code,
+            use_ddp=sync_codebook,
+            learnable_codebook=has_codebook_orthogonal_loss or learnable_codebook,
+            sample_codebook_temp=sample_codebook_temp,
+            gumbel_sample=partial(
+                gumbel_sample,
+                stochastic=stochastic_sample_codes,
+                straight_through=straight_through
+            ),
+            ema_update=ema_update,
+            manual_ema_update=manual_ema_update,
+            use_cosine_sim=use_cosine_sim
+        )
+
+        if affine_param:
+            assert not use_cosine_sim, "affine param only compatible with euclidean codebook"
+            codebook_kwargs = dict(
+                **codebook_kwargs,
+                affine_param=True,
+                sync_affine_param=sync_affine_param,
+                affine_param_batch_decay=affine_param_batch_decay,
+                affine_param_codebook_decay=affine_param_codebook_decay
+            )
+
+        self._codebook = Codebook(**codebook_kwargs)
+
+        self.in_place_codebook_optimizer = \
+            in_place_codebook_optimizer(self._codebook.parameters()) \
+            if exists(in_place_codebook_optimizer) else None
+
+        self.manual_in_place_optimizer_update = manual_in_place_optimizer_update
+
+        self.codebook_size = codebook_size
+        self.accept_image_fmap = accept_image_fmap
+        self.channel_last = channel_last
+
+        self.register_buffer('zero', tensor(0.), persistent=False)
+        self.return_zeros_for_masked_padding = return_zeros_for_masked_padding
+        self.freeze_codebook = freeze_codebook
+
+
+    # ===============================
+    # properties
+    # ===============================
+
+    @property
+    def ema_update(self):
+        """
+        Input:
+            - No external inputs beyond module state.
+        Method:
+            - Executes the `VectorQuantizer.ema_update` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        return self._codebook.ema_update
+
+    @property
+    def codebook(self):
+        """
+        Input:
+            - No external inputs beyond module state.
+        Method:
+            - Executes the `VectorQuantizer.codebook` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        codebook = self._codebook.embed
+        if self.separate_codebook_per_head:
+            return codebook
+        return rearrange(codebook, '1 ... -> ...')
+
+    @codebook.setter
+    def codebook(self, codes):
+        """
+        Input:
+            - codes: shape [*]; default: required.
+        Method:
+            - Executes the `VectorQuantizer.codebook` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        if not self.separate_codebook_per_head:
+            codes = rearrange(codes, '... -> 1 ...')
+        self._codebook.embed.copy_(codes)
+
+    
+    def get_codes_from_indices(self, indices):
+        """
+        Input:
+            - indices: shape [*]; default: required.
+        Method:
+            - Executes the `VectorQuantizer.get_codes_from_indices` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        codebook = self.codebook
+        is_multiheaded = codebook.ndim > 2
+
+        if not is_multiheaded:
+            codes = codebook[indices]
+        else:
+            indices, unpack_one = pack_one(indices, 'b * h')
+            indices = rearrange(indices, 'b n h -> b h n')
+
+            indices = repeat(indices, 'b h n -> b h n d', d = codebook.shape[-1])
+            codebook = repeat(codebook, 'h n d -> b h n d', b = indices.shape[0])
+
+            codes = codebook.gather(2, indices)
+            codes = rearrange(codes, 'b h n d -> b n (h d)')
+            codes = unpack_one(codes, 'b * d')
+
+        if not self.channel_last:
+            codes = rearrange(codes, 'b ... d -> b d ...')
+
+        return codes
+
+    def get_output_from_indices(self, indices):
+        """
+        Input:
+            - indices: shape [*]; default: required.
+        Method:
+            - Executes the `VectorQuantizer.get_output_from_indices` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        codes = self.get_codes_from_indices(indices)
+        return self.project_out(codes)
+
+    def update_in_place_optimizer(self):
+        """
+        Input:
+            - No external inputs beyond module state.
+        Method:
+            - Executes the `VectorQuantizer.update_in_place_optimizer` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        if not exists(self.in_place_codebook_optimizer):
+            return
+
+        # handle ddp, thanks to @gdoras
+
+        if self._codebook.use_ddp:
+
+            for param in self._codebook.parameters():
+                if not exists(param.grad):
+                    continue
+
+                distributed.all_reduce(param.grad)
+                param.grad /= distributed.get_world_size()
+
+        # optimizer step
+
+        self.in_place_codebook_optimizer.step()
+        self.in_place_codebook_optimizer.zero_grad()
+
+    def maybe_split_heads_from_input(self, x):
+        """
+        Input:
+            - x: shape [*]; default: required.
+        Method:
+            - Executes the `VectorQuantizer.maybe_split_heads_from_input` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        if self.heads == 1:
+            return x
+
+        ein_rhs_eq = 'h b n d' if self.separate_codebook_per_head else '1 (b h) n d'
+        return rearrange(x, f'b n (h d) -> {ein_rhs_eq}', h = self.heads)
+
+    def expire_codes_(self, x):
+        """
+        Input:
+            - x: shape [*]; default: required.
+        Method:
+            - Executes the `VectorQuantizer.expire_codes_` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        x = self._codebook.transform_input(x)
+        x = self.maybe_split_heads_from_input(x)
+        self._codebook.expire_codes_(x)
+
+    def update_ema_indices(self, x, indices, mask = None):
+        """
+        Input:
+            - x: shape [*]; default: required.
+            - indices: shape [*]; default: required.
+            - mask: shape [*]; default: None.
+        Method:
+            - Executes the `VectorQuantizer.update_ema_indices` logic using the provided inputs and current module state.
+        Output:
+            - return: value(s) produced by this helper; exact shape follows the implementation below.
+        """
+        if self.accept_image_fmap:
+            assert not exists(mask)
+            height, width = x.shape[-2:]
+            x = rearrange(x, 'b c h w -> b (h w) c')
+
+        if not self.channel_last and not self.accept_image_fmap:
+            x = rearrange(x, 'b d n -> b n d')
+
+        x = self.project_in(x)
+        x = self.maybe_split_heads_from_input(x)
+        x = self._codebook.transform_input(x)
+
+        if self.heads > 1:
+            if self.separate_codebook_per_head:
+                indices = rearrange(indices, 'b n h -> h b n')
+            else:
+                indices = rearrange(indices, 'b n h -> 1 (b h) n')
+
+        if self.accept_image_fmap:
+             indices = rearrange(indices, 'b h w ... -> b (h w) ...')
+
+        if x.ndim == 2: # only one token
+             indices = rearrange(indices, 'b ... -> b 1 ...')
+
+        self._codebook.update_ema_indices(x, indices, mask = mask)
+
+
+    # ===========================================================
+    # forward()
+    # ===========================================================
+
+    def forward(
+        self,
+        x,
+        indices=None,
+        mask=None,
+        lens=None,
+        topk=None,
+        sample_codebook_temp=None,
+        freeze_codebook=None,
+        return_loss_breakdown=False,
+        codebook_transform_fn=None,
+        ema_update_weight=None,
+        accum_ema_update=False,
+        ema_update=None
+    ):
+        
+        """
+        Input:
+            - x (torch.Tensor): shape [B, N, D] or compatible multihead latent layout; default: required.
+            - indices (torch.Tensor | None): shape [B, N] or None; default: None.
+            - mask (torch.Tensor | None): shape [B, N] or None; default: None.
+            - sample_codebook_temp (float | None): shape []; default: None.
+            - freeze_codebook (bool): shape []; default: False.
+            - return_loss_breakdown (bool): shape []; default: False.
+        Method:
+            - Projects encoder latents into codebook space, performs quantization, computes commitment and auxiliary losses, and projects quantized vectors back to the model dimension.
+        Output:
+            - return: tuple containing quantized latents, chosen indices, VQ loss dictionary, and perplexity statistics.
+        """
+        orig_input, input_requires_grad = x, x.requires_grad
+        # print(self.use_cosine_sim, x.shape)
+
+        freeze_codebook = default(freeze_codebook, self.freeze_codebook)
+
+        # mask / lens
+        assert not (exists(mask) and exists(lens))
+        if exists(lens):
+            mask = lens_to_mask(lens, x.shape[1])
+
+        only_one = x.ndim == 2
+        if only_one:
+            assert not exists(mask)
+            x = rearrange(x, 'b d -> b 1 d')
+
+        shape = x.shape
+        device = x.device
+        heads = self.heads
+        is_multiheaded = heads > 1
+
+        need_transpose = not self.channel_last and not self.accept_image_fmap
+        should_inplace = exists(self.in_place_codebook_optimizer)
+
+        # ========= reshape input =========
+
+        if self.accept_image_fmap:
+            assert not exists(mask)
+            h, w = x.shape[-2:]
+            x = rearrange(x, 'b c h w -> b (h w) c')
+
+        if need_transpose:
+            x = rearrange(x, 'b d n -> b n d')
+
+        x = self.project_in(x)
+        x = self.maybe_split_heads_from_input(x)
+
+        x = self._codebook.transform_input(x)
+
+        # ========= call Codebook.forward() =========
+
+        quantize, embed_ind, distances = self._codebook(
+            x,
+            sample_codebook_temp=sample_codebook_temp,
+            mask=mask,
+            freeze_codebook=freeze_codebook,
+            codebook_transform_fn=codebook_transform_fn,
+            ema_update_weight=ema_update_weight,
+            accum_ema_update=accum_ema_update,
+            ema_update=ema_update,
+            topk=topk
+        )
+
+        # ===============================
+        # In-place optimizer update
+        # ===============================
+        inplace_optimize_loss = self.zero
+
+        if should_inplace and self.training and not freeze_codebook:
+
+            if exists(mask):
+                loss = F.mse_loss(
+                    quantize, x.detach(), reduction='none'
+                )
+
+                loss_mask = mask
+                if is_multiheaded:
+                    loss_mask = repeat(mask, 'b n -> c (b h) n',
+                                       c=loss.shape[0],
+                                       h=loss.shape[1] // mask.shape[0])
+
+                loss = loss[loss_mask].mean()
+
+            else:
+                loss = F.mse_loss(quantize, x.detach())
+
+            loss.backward()
+
+            if not self.manual_in_place_optimizer_update:
+                self.update_in_place_optimizer()
+
+            inplace_optimize_loss = loss
+
+            # re-quantize
+            quantize, embed_ind, distances = self._codebook(
+                x,
+                sample_codebook_temp=sample_codebook_temp,
+                mask=mask,
+                freeze_codebook=freeze_codebook,
+                codebook_transform_fn=codebook_transform_fn,
+                ema_update_weight=ema_update_weight,
+                accum_ema_update=accum_ema_update,
+                ema_update=ema_update,
+                topk=topk
+            )
+
+        # ===============================
+        # commit loss / rotation / ste
+        # ===============================
+
+        # defaults
+        commit_loss = self.zero
+        orthogonal_reg_loss = self.zero
+        codebook_diversity_loss = self.zero
+
+        if self.training:
+
+            commit_quantize = \
+                quantize.detach() if (not self.learnable_codebook or freeze_codebook) \
+                else quantize
+
+            if input_requires_grad:
+                if self.rotation_trick:
+                    quantize = rotate_to(x, quantize)
+                elif self.directional_reparam:
+                    quantize = directional_reparam(x, quantize, self.directional_reparam_variance)
+                else:
+                    quantize = straight_through(x, quantize)
+
+            if self.sync_update_v > 0:
+                quantize = quantize + self.sync_update_v * (quantize - quantize.detach())
+
+        # ================ cross entropy path for commit loss ====================
+
+        def compute_ce_loss(target_codes):
+            """
+            Input:
+                - target_codes: shape [*]; default: required.
+            Method:
+                - Executes the `VectorQuantizer.forward.compute_ce_loss` logic using the provided inputs and current module state.
+            Output:
+                - return: value(s) produced by this helper; exact shape follows the implementation below.
+            """
+            if not is_multiheaded:
+                dist_eq = '1 b n l -> b l n'
+            elif self.separate_codebook_per_head:
+                dist_eq = 'c b n l -> b l n c'
+            else:
+                dist_eq = '1 (b h) n l -> b l n h'
+
+            return F.cross_entropy(
+                rearrange(distances, dist_eq, b=shape[0]),
+                target_codes,
+                ignore_index=-1
+            )
+
+        if indices is not None:
+            return quantize, compute_ce_loss(indices)
+
+        # ==========================
+        # training losses
+        # ==========================
+
+        loss = tensor(0., device=device, requires_grad=self.training)
+
+        if self.training:
+
+            # diversity loss
+            if self.has_codebook_diversity_loss:
+                prob = (distances * self.codebook_diversity_temperature).softmax(dim=-1)
+                avg_prob = reduce(prob, '... n l -> n l', 'mean')
+                codebook_diversity_loss = -entropy(avg_prob).mean()
+                # print(loss, codebook_diversity_loss, self.codebook_diversity_loss_weight)
+                loss = loss + codebook_diversity_loss * self.codebook_diversity_loss_weight
+
+            # commitment loss
+            if self.has_commitment_loss:
+
+                if self.commitment_use_cross_entropy_loss:
+                    if exists(mask):
+                        ce_mask = mask
+                        if is_multiheaded:
+                            ce_mask = repeat(ce_mask, 'b n -> b n h', h=heads)
+                        embed_ind.masked_fill_(~ce_mask, -1)
+
+                    commit_loss = compute_ce_loss(embed_ind)
+
+                else:
+                    if exists(mask):
+                        commit_loss = F.mse_loss(
+                            commit_quantize,
+                            orig_input,
+                            reduction='none'
+                        )
+                        loss_mask = mask
+
+                        if is_multiheaded:
+                            loss_mask = repeat(mask, 'b n -> c (b h) n',
+                                               c=commit_loss.shape[0],
+                                               h=commit_loss.shape[1] // mask.shape[0])
+
+                        commit_loss = commit_loss[loss_mask].mean()
+                    else:
+                        commit_loss = F.mse_loss(commit_quantize, x)
+
+                # print(loss, commit_loss, self.commitment_weight)
+                loss = loss + commit_loss * self.commitment_weight
+
+            # orthogonal regularization
+            if self.has_codebook_orthogonal_loss:
+                codebook = self._codebook.embed
+
+                if self.orthogonal_reg_active_codes_only:
+                    assert not (is_multiheaded and self.separate_codebook_per_head)
+                    unique_ids = torch.unique(embed_ind)
+                    codebook = codebook[:, unique_ids]
+
+                num_codes = codebook.shape[-2]
+                if exists(self.orthogonal_reg_max_codes) and num_codes > self.orthogonal_reg_max_codes:
+                    perm = torch.randperm(num_codes, device=device)[:self.orthogonal_reg_max_codes]
+                    codebook = codebook[:, perm]
+
+                orthogonal_reg_loss = orthogonal_loss_fn(codebook)
+                loss = loss + orthogonal_reg_loss * self.orthogonal_reg_weight
+
+        # ===============================
+        # merge heads back
+        # ===============================
+
+        if is_multiheaded:
+            if self.separate_codebook_per_head:
+                quantize = rearrange(quantize, 'h b n d -> b n (h d)', h=heads)
+            else:
+                quantize = rearrange(quantize, '1 (b h) n d -> b n (h d)', h=heads)
+
+        quantize = self.project_out(quantize)
+
+        # reshape back
+        if need_transpose:
+            quantize = rearrange(quantize, 'b n d -> b d n')
+
+        if self.accept_image_fmap:
+            quantize = rearrange(quantize, 'b (h w) c -> b c h w', h=h, w=w)
+
+        if only_one:
+            quantize = rearrange(quantize, 'b 1 d -> b d')
+
+        # mask padding
+        if exists(mask):
+            zero_input = torch.zeros_like(orig_input)
+            quantize = einx.where('b n, b n ... d, b n d -> b n ... d',
+                                  mask, quantize, zero_input)
+
+            embed_ind = einx.where('b n, b n ..., -> b n ...',
+                                   mask, embed_ind, -1)
+
+        # ===============================
+        # Final: return (quantize, indices, loss dict)
+        # ===============================
+
+        loss_dict = {
+            "loss": loss,
+            "commit_loss": commit_loss,
+            "codebook_diversity_loss": codebook_diversity_loss,
+            "orthogonal_reg_loss": orthogonal_reg_loss,
+            "inplace_optimize_loss": inplace_optimize_loss
+        }
+        
+        
+
+        with torch.no_grad():
+            flat = embed_ind.view(-1)
+            flat = flat[flat >= 0]
+            if flat.numel() == 0:
+                perplexity = torch.tensor(0.0, device=device)
+            else:
+                K = self.codebook_size
+                counts = torch.bincount(flat, minlength=K).float()
+                probs = counts / counts.sum().clamp(min=1.0)
+                perplexity = torch.exp(-(probs * torch.log(probs.clamp(min=1e-10))).sum())
+
+        if return_loss_breakdown:
+            return quantize, embed_ind, loss, LossBreakdown(
+                commit_loss,
+                codebook_diversity_loss,
+                orthogonal_reg_loss,
+                inplace_optimize_loss
+            )
+
+        # print(loss, commit_loss, codebook_diversity_loss, orthogonal_reg_loss, inplace_optimize_loss)
+        # print(perplexity)
+
+        return quantize, embed_ind, loss_dict, perplexity
+
+
+
+# ===========================
+# 外部调用的量化封装
+# ===========================
+def quantize(z, vq_model, transpose_channel_length_axes=False, svq_temp: Union[float, None] = None):
+    """
+    Input:
+        - z (torch.Tensor): shape [B, N, C], [B, C, L], or [B, C, H, W]; default: required.
+        - vq_model (VectorQuantizer): vector quantizer instance; default: required.
+        - transpose_channel_length_axes (bool): shape []; default: False.
+        - svq_temp (float | None): shape []; default: None.
+    Method:
+        - Reshapes latent tensors into token-major form, applies the vector quantizer, and restores the original layout when needed.
+    Output:
+        - z_q (torch.Tensor): same semantic layout as `z`.
+        - indices (torch.Tensor): shape [B, N] or broadcast-equivalent codebook indices.
+        - vq_loss (dict): scalar loss terms from the quantizer.
+        - perplexity (torch.Tensor): shape [] or [1], codebook perplexity.
+    """
+    input_dim = len(z.shape) - 2
+    if input_dim == 2:
+        h, w = z.shape[2:]
+        z = rearrange(z, 'b c h w -> b (h w) c')
+        z_q, indices, vq_loss, perplexity = vq_model(z, svq_temp)
+        z_q = rearrange(z_q, 'b (h w) c -> b c h w', h=h, w=w)
+    elif input_dim == 1:
+        if transpose_channel_length_axes:
+            z = rearrange(z, 'b c l -> b (l) c')
+        z_q, indices, vq_loss, perplexity = vq_model(z, svq_temp)
+        if transpose_channel_length_axes:
+            z_q = rearrange(z_q, 'b (l) c -> b c l')
+    else:
+        raise ValueError("quantize 只支持 1D 或 2D 空间维度的输入")
+
+    return z_q, indices, vq_loss, perplexity

@@ -1,0 +1,39 @@
+# Conda environment file for QUALS.
+# Usage:
+#   conda env create -f environment.txt
+#   conda activate quals
+#
+# Tested reference environment:
+#   Python 3.9.24
+#   PyTorch 2.7.1 + CUDA 12.8
+#   torchvision 0.22.1 + CUDA 12.8
+#
+# If your CUDA driver is different, install the matching PyTorch build
+# from https://pytorch.org/get-started/locally/ after creating this env.
+
+name: quals
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - numpy=1.26
+  - scipy>=1.13
+  - scikit-learn>=1.6
+  - h5py>=3.10
+  - pandas>=2.0
+  - matplotlib>=3.8
+  - tqdm>=4.66
+  - pyyaml>=6.0
+  - tensorboard>=2.18
+  - pytorch>=2.0
+  - torchvision>=0.17
+  - pip:
+      - einops>=0.8
+      - easydict>=1.13
+      - easytorch>=1.3.3
+      - setproctitle>=1.3
+      - orjson>=3.10
